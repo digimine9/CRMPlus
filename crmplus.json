@@ -1,6 +1,6 @@
 {
   "version": "1.3",
   "majorUpdate": false,
-  "downloadUrl": "https://github.com/digimine9/CRMPlus/releases/download/v1.3/CRMPlus.exe",
-  "patchNotes": "- Fixed update mechanism\n- Improved performance\n- Added new reporting features\n- UI enhancements"
-} 
+  "downloadUrl": "https://github.com/digimine9/CRMPlus/releases/download/1.3/CRMPlus.exe",
+  "patchNotes": "Updated to v1.3 with white logo shifted left, three collapsible sections in About tab, and fixed warnings."
+}
