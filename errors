@@ -1,43 +1,4 @@
-OUTPUT: Starting MITMproxy...
-OUTPUT: Config written to C:\CRMplus\JSONs\config.json
-OUTPUT: MITMproxy started with PID 67192
-ERROR: Error: mitmproxy's console interface requires a tty. Please run mitmproxy in an interactive shell environment.
-ERROR: Traceback (most recent call last):
-ERROR:   File "C:\Users\noahw\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mitmproxy\master.py", line 84, in run
-ERROR:     await self.running()
-ERROR:   File "C:\Users\noahw\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mitmproxy\tools\console\master.py", line 210, in running
-ERROR:     sys.exit(1)
-ERROR:     ~~~~~~~~^^^
-ERROR: SystemExit: 1
-ERROR: 
-ERROR: During handling of the above exception, another exception occurred:
-ERROR: 
-ERROR: Traceback (most recent call last):
-ERROR:   File "<frozen runpy>", line 198, in _run_module_as_main
-ERROR:   File "<frozen runpy>", line 88, in _run_code
-ERROR:   File "C:\Users\noahw\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\mitmproxy.exe\__main__.py", line 7, in <module>
-ERROR:     sys.exit(mitmproxy())
-ERROR:              ~~~~~~~~~^^
-ERROR:   File "C:\Users\noahw\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mitmproxy\tools\main.py", line 143, in mitmproxy
-ERROR:     run(console.master.ConsoleMaster, cmdline.mitmproxy, args)
-ERROR:     ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-ERROR:   File "C:\Users\noahw\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mitmproxy\tools\main.py", line 137, in run
-ERROR:     return asyncio.run(main())
-ERROR:            ~~~~~~~~~~~^^^^^^^^
-ERROR:   File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.752.0_x64__qbz5n2kfra8p0\Lib\asyncio\runners.py", line 195, in run
-ERROR:     return runner.run(main)
-ERROR:            ~~~~~~~~~~^^^^^^
-ERROR:   File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.752.0_x64__qbz5n2kfra8p0\Lib\asyncio\runners.py", line 118, in run
-ERROR:     return self._loop.run_until_complete(task)
-ERROR:            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
-ERROR:   File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.752.0_x64__qbz5n2kfra8p0\Lib\asyncio\base_events.py", line 725, in run_until_complete
-ERROR:     return future.result()
-ERROR:            ~~~~~~~~~~~~~^^
-ERROR:   File "C:\Users\noahw\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mitmproxy\tools\main.py", line 134, in main
-ERROR:     await master.run()
-ERROR:   File "C:\Users\noahw\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mitmproxy\master.py", line 94, in run
-ERROR:     await self.done()
-ERROR:   File "C:\Users\noahw\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mitmproxy\tools\console\master.py", line 250, in done
-ERROR:     self.loop.stop()
-ERROR:     ^^^^^^^^^
-ERROR: AttributeError: 'ConsoleMaster' object has no attribute 'loop'
+cd C:\CRMplus\Main.java
+javac -d ..\bin CRMplus.java
+cd ..\bin
+jar cfe CRMplus.jar CRMplus *.class
