@@ -1,2 +1,1 @@
-URL INSERT HERE
-
+https://github.com/digimine9/CRMPlus/releases/download/1.7/CRMPlus.exe
