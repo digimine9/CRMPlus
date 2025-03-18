@@ -52,6 +52,10 @@ last_cosmetic_fetch: float = 0
 current_cosmetics: Dict[str, str] = {}
 selected_cosmetics: Dict[str, str] = {}
 fortnite_version: str = ""
+response_cache = {}
+cache_ttl = 300  # 5 minutes
+last_kicks = []
+kick_patterns = {}
 config: Dict[str, Any] = {
     "enableAllSkins": True,
     "enableAllBackblings": True,
@@ -81,6 +85,7 @@ class FortniteVersionManager:
     
     def __init__(self):
         self.current_version = None
+        self.baseline_version = None  # New: Tracks the version set at publish
         self.known_versions = {}
         self.last_check = 0
         self.check_interval = 3600  # 1 hour
@@ -93,9 +98,10 @@ class FortniteVersionManager:
                     with open(VERSION_FILE, "r", encoding='utf-8') as f:
                         version_data = json.load(f)
                         self.current_version = version_data.get("current_version")
+                        self.baseline_version = version_data.get("baseline_version")  # Load baseline
                         self.known_versions = version_data.get("known_versions", {})
                         self.last_check = version_data.get("last_check", 0)
-                    logger.info(f"Loaded version info: current_version={self.current_version}")
+                    logger.info(f"Loaded version info: current_version={self.current_version}, baseline_version={self.baseline_version}")
                 else:
                     logger.warning("No version info file found")
             except Exception as e:
@@ -107,19 +113,20 @@ class FortniteVersionManager:
             try:
                 version_data = {
                     "current_version": self.current_version,
+                    "baseline_version": self.baseline_version,  # Save baseline
                     "known_versions": self.known_versions,
                     "last_check": self.last_check
                 }
                 with open(VERSION_FILE, "w", encoding='utf-8') as f:
                     json.dump(version_data, f, indent=2)
-                logger.info(f"Saved version info: current_version={self.current_version}")
+                logger.info(f"Saved version info: current_version={self.current_version}, baseline_version={self.baseline_version}")
             except Exception as e:
                 logger.error(f"Failed to save version info: {e}")
     
     def check_fortnite_version(self) -> bool:
         """
         Check if the current Fortnite version is compatible by monitoring local directory changes
-        Returns: True if compatible (matches initial or unchanged version), False if changed
+        Returns: True if compatible (matches baseline or set at publish), False if updated post-baseline
         """
         current_time = time.time()
         
@@ -131,50 +138,35 @@ class FortniteVersionManager:
                 logger.error(f"Fortnite directory not found: {fortnite_dir}")
                 return self.current_version is not None
             
-            # Get the latest modification time of key files
-            key_files = [
-                fortnite_dir / "FortniteClient-Win64-Shipping.exe",
-                fortnite_dir / "FortniteLauncher.exe"
-            ]
-            latest_mtime = 0
-            for file in key_files:
-                if file.exists():
-                    mtime = file.stat().st_mtime
-                    latest_mtime = max(latest_mtime, mtime)
-                else:
-                    logger.warning(f"Key file not found: {file}")
+            # Use deep_version_check to get the current version
+            new_version = deep_version_check()
             
-            if not latest_mtime:
-                logger.warning("No key files found to determine version")
-                return self.current_version is not None
-            
-            # Use modification time as a version proxy (convert to string)
-            new_version = f"mtime_{int(latest_mtime)}"
-            
-            # If no version info exists (fresh publish), assume this is the compatible version
-            if not VERSION_FILE.exists() or not self.current_version:
-                logger.info(f"Initial version detected: {new_version} - assuming compatible")
+            # If no baseline exists (fresh publish), set it and mark as compatible
+            if not self.baseline_version:
+                logger.info(f"Setting initial baseline version: {new_version} - compatible with the latest version of Fornite!")
                 self.current_version = new_version
+                self.baseline_version = new_version
                 self.known_versions[new_version] = {"first_seen": current_time, "compatible": True}
                 self.last_check = current_time
                 self.save_version_info()
                 return True
             
-            # Check if version (mtime) changed
-            if new_version != self.current_version:
-                logger.warning(f"Fortnite version changed: {self.current_version} -> {new_version} (based on file updates)")
+            # If current version differs from baseline, mark as incompatible
+            if new_version != self.baseline_version:
+                logger.warning(f"Fortnite version changed post-baseline: {self.baseline_version} -> {new_version}")
                 self.current_version = new_version
                 self.known_versions[new_version] = {"first_seen": current_time, "compatible": False}
                 self.save_version_info()
                 return False
             
-            # If version matches and within check interval, use cached compatibility
-            if current_time - self.last_check < self.check_interval:
-                return self.is_version_compatible(self.current_version)
-            
+            # If it matches the baseline, it’s compatible
+            logger.info(f"Version matches baseline: {new_version}")
+            self.current_version = new_version
+            if new_version not in self.known_versions:
+                self.known_versions[new_version] = {"first_seen": current_time, "compatible": True}
             self.last_check = current_time
             self.save_version_info()
-            return self.is_version_compatible(new_version)
+            return True
             
         except Exception as e:
             logger.error(f"Failed to check Fortnite version from local directory: {e}")
@@ -369,7 +361,7 @@ def randomize_cosmetics() -> None:
         }
         logger.info(f"Randomized cosmetics: {selected_cosmetics['skins']} (skin), {selected_cosmetics['backblings']} (backbling)")
 
-def get_cosmetic(category: str) -> str:
+def get_cosmetic(category: str, avoid: Optional[List[str]] = None) -> str:
     """Select a cosmetic item from the specified category"""
     cosmetics = load_cosmetics()
     enabled_key = f"enableAll{category.capitalize()}"
@@ -396,13 +388,16 @@ def get_cosmetic(category: str) -> str:
         except Exception as e:
             logger.warning(f"Could not read recent {category} file: {e}")
     
-    # Filter out recently used items
-    available_items = [item for item in cosmetics[category] if item not in recent_items]
+    # Filter out recently used items and problematic items
+    avoid_items = set(recent_items)
+    if avoid:
+        avoid_items.update(avoid)
+    available_items = [item for item in cosmetics[category] if item not in avoid_items]
     
-    # If too few items remain, reset the filter
+    # If too few items remain, reset the filter but still avoid problematic items
     min_items = max(3, len(cosmetics[category]) // 10)
     if len(available_items) < min_items:
-        available_items = cosmetics[category]
+        available_items = [item for item in cosmetics[category] if avoid is None or item not in avoid]
     
     # Select a random item
     selected = random.choice(available_items) if available_items else DEFAULT_COSMETICS[category]
@@ -465,7 +460,13 @@ def detect_game_mode(content: bytes) -> Optional[str]:
     return None
 
 def is_cosmetics_url(url: str) -> bool:
-    """Check if the URL is related to cosmetics endpoints"""
+    """More precise endpoint filtering to reduce unnecessary processing"""
+    # Add exact path matching with regex for better precision
+    patterns = [
+        r"/fortnite/api/game/v2/profile/[^/]+/client/[^/]+$",
+        r"/fortnite/api/game/v2/cosmetics/config/[^/]+$",
+        r"/content/api/pages/fortnite-game/[^/]+$"
+    ]
     endpoints = [
         "/fortnite/api/game/v2/profile",
         "/fortnite/api/game/v2/cosmetics/config",
@@ -475,7 +476,7 @@ def is_cosmetics_url(url: str) -> bool:
         "/fortnite/api/cloudstorage/system",
         "/fortnite/api/game/v2/cosmetics/preset"
     ]
-    return any(endpoint in url for endpoint in endpoints)
+    return any(re.match(pattern, url) for pattern in patterns) or any(endpoint in url for endpoint in endpoints)
 
 def is_match_start(content: bytes) -> bool:
     """Detect if a match is starting based on the content"""
@@ -508,12 +509,16 @@ def is_kick_message(content: bytes) -> bool:
             # Check for various kick indicators
             error_msg = data.get("errorMessage", "")
             if isinstance(error_msg, str) and ("kick" in error_msg.lower() or "banned" in error_msg.lower()):
+                with selection_lock:
+                    last_kicks.append({"timestamp": time.time(), "cosmetics": selected_cosmetics.copy()})
                 return True
             
             # Check for error codes
             if "errorCode" in data:
                 error_codes = ["COSMETIC_VALIDATION", "ITEM_NOT_OWNED", "LOADOUT_INVALID"]
                 if data.get("errorCode") in error_codes:
+                    with selection_lock:
+                        last_kicks.append({"timestamp": time.time(), "cosmetics": selected_cosmetics.copy()})
                     return True
     except Exception:
         pass
@@ -523,6 +528,104 @@ def is_kick_message(content: bytes) -> bool:
 def hash_content(content: bytes) -> str:
     """Create a hash of the content for caching and comparison"""
     return hashlib.md5(content).hexdigest()
+
+def cache_response(url: str, content: bytes) -> None:
+    """Cache response content for frequently accessed endpoints"""
+    global response_cache
+    response_cache[url] = {
+        "content": content,
+        "timestamp": time.time()
+    }
+
+def get_cached_response(url: str) -> Optional[bytes]:
+    """Get cached response if available and not expired"""
+    cached = response_cache.get(url)
+    if cached and (time.time() - cached["timestamp"] < cache_ttl):
+        return cached["content"]
+    return None
+
+def cleanup_memory() -> None:
+    """Periodically clean up memory to prevent leaks"""
+    global response_cache, cosmetics_cache
+    
+    # Clean expired cache entries
+    current_time = time.time()
+    expired_urls = [url for url, data in response_cache.items() 
+                   if current_time - data["timestamp"] > cache_ttl]
+    
+    for url in expired_urls:
+        del response_cache[url]
+    
+    # Manage cosmetics cache size
+    if len(str(cosmetics_cache)) > 10_000_000:  # If cache is over 10MB
+        with cache_lock:
+            cosmetics_cache = {}
+            last_cosmetic_fetch = 0
+
+def deep_version_check() -> str:
+    """More sophisticated version detection"""
+    try:
+        # Look for pak files and their timestamps
+        fortnite_paks = Path("C:/Program Files/Epic Games/Fortnite/FortniteGame/Content/Paks")
+        if fortnite_paks.exists():
+            pak_files = list(fortnite_paks.glob("*.pak"))
+            if pak_files:
+                # Get the newest pak file
+                newest_pak = max(pak_files, key=lambda p: p.stat().st_mtime)
+                # Use filename and timestamp for version identification
+                pak_name = newest_pak.name
+                pak_time = int(newest_pak.stat().st_mtime)
+                return f"pak_{pak_name}_{pak_time}"
+        
+        # Fallback to executable check
+        fortnite_dir = Path("C:/Program Files/Epic Games/Fortnite/FortniteGame/Binaries/Win64")
+        key_files = [
+            fortnite_dir / "FortniteClient-Win64-Shipping.exe",
+            fortnite_dir / "FortniteLauncher.exe"
+        ]
+        latest_mtime = 0
+        for file in key_files:
+            if file.exists():
+                mtime = file.stat().st_mtime
+                latest_mtime = max(latest_mtime, mtime)
+        return f"mtime_{int(latest_mtime)}"
+    except Exception as e:
+        logger.error(f"Deep version check failed: {e}")
+        return f"unknown_{int(time.time())}"
+
+def analyze_kick_patterns() -> None:
+    """Analyze kicks to identify problematic cosmetics"""
+    global kick_patterns, selected_cosmetics
+    
+    if len(last_kicks) < 3:
+        return
+    
+    # Count occurrences of each cosmetic in kicks
+    cosmetic_counts = {}
+    for kick_data in last_kicks:
+        for category, item_id in kick_data["cosmetics"].items():
+            if item_id not in cosmetic_counts:
+                cosmetic_counts[item_id] = 0
+            cosmetic_counts[item_id] += 1
+    
+    # Identify potentially problematic cosmetics
+    problem_items = [item_id for item_id, count in cosmetic_counts.items() 
+                    if count >= len(last_kicks) // 2]
+    
+    if problem_items:
+        logger.warning(f"Potentially problematic cosmetics detected: {problem_items}")
+        
+        # Add to kick patterns
+        for item_id in problem_items:
+            if item_id not in kick_patterns:
+                kick_patterns[item_id] = 0
+            kick_patterns[item_id] += 1
+            
+        # Avoid using these items in future
+        for category in selected_cosmetics:
+            if selected_cosmetics[category] in problem_items:
+                logger.info(f"Replacing potentially problematic {category}: {selected_cosmetics[category]}")
+                selected_cosmetics[category] = get_cosmetic(category, avoid=problem_items)
 
 def modify_json_content(content: bytes, url: str) -> bytes:
     """Modify JSON content to replace cosmetic items"""
@@ -541,6 +644,7 @@ def modify_json_content(content: bytes, url: str) -> bytes:
         # Check if it's a kick message
         if is_kick_message(content) and config.get("notifyOnKick", True):
             logger.warning("Detected possible cosmetic kick. Consider changing cosmetics or checking for updates.")
+            analyze_kick_patterns()
         
         # Check for match start and randomize if needed
         if is_match_start(content) and config.get("randomizeEachMatch", True):
@@ -615,10 +719,37 @@ def modify_json_content(content: bytes, url: str) -> bytes:
             logger.debug(f"Traceback: {traceback.format_exc()}")
         return content
 
+def modify_headers(flow: http.HTTPFlow) -> None:
+    """Modify request headers to avoid easy detection"""
+    if flow.request and "epicgames.com" in flow.request.host:
+        # Remove identifiable headers
+        if "X-EpicGames-Client" in flow.request.headers:
+            del flow.request.headers["X-EpicGames-Client"]
+            
+        # Add randomization to user agent occasionally
+        if random.randint(1, 10) == 1:
+            flow.request.headers["User-Agent"] = random.choice([
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0"
+            ])
+
+def randomize_timing(flow: http.HTTPFlow) -> None:
+    """Slightly randomize request timing to avoid detection patterns"""
+    if random.random() < 0.3:  # 30% chance to delay
+        delay = random.uniform(0.05, 0.2)  # 50-200ms delay
+        time.sleep(delay)
+
 def request(flow: http.HTTPFlow) -> None:
     """Handle outgoing requests"""
     if not flow.request or not flow.request.url:
         return
+    
+    # Apply packet timing randomization
+    randomize_timing(flow)
+    
+    # Modify headers for anti-detection
+    modify_headers(flow)
     
     # Debug logging
     is_related = is_cosmetics_url(flow.request.url)
@@ -644,15 +775,27 @@ def response(flow: http.HTTPFlow) -> None:
     if not flow.request or not flow.request.url:
         return
     
+    # Check for cached response
+    cached_content = get_cached_response(flow.request.url)
+    if cached_content is not None:
+        flow.response.content = cached_content
+        return
+    
     # Check for related endpoints
     if is_cosmetics_url(flow.request.url) and flow.response and flow.response.content:
         try:
             flow.response.content = modify_json_content(flow.response.content, flow.request.url)
+            # Cache the modified response
+            cache_response(flow.request.url, flow.response.content)
         except Exception as e:
             logger.error(f"Response modification failed: {e}")
             if config.get("debugMode", False):
                 import traceback
                 logger.debug(f"Traceback: {traceback.format_exc()}")
+    
+    # Periodic memory cleanup (e.g., every 10 responses, adjust as needed)
+    if random.randint(1, 10) == 1:
+        cleanup_memory()
 
 def error(flow: http.HTTPFlow) -> None:
     """Handle errors in requests/responses"""
