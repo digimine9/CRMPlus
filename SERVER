@@ -1,0 +1,728 @@
+from mitmproxy import http
+import json
+import os
+import random
+import requests
+import time
+import logging
+import certifi
+import hashlib
+import re
+from typing import Dict, List, Optional, Tuple, Any
+from threading import Lock
+from pathlib import Path
+
+# Configure logging with more detailed formatting
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(Path("C:/CRMplus/proxy.log"), mode='a')
+    ]
+)
+logger = logging.getLogger('fortnite_proxy')
+
+# Paths
+BASE_DIR = Path("C:/CRMplus")
+COSMETICS_CACHE = BASE_DIR / "cosmetics_cache.json"
+CONFIG_FILE = BASE_DIR / "JSONs" / "config.json"
+CERT_FILE = BASE_DIR / "cert.pem"
+VERSION_FILE = BASE_DIR / "version_info.json"
+
+# Create necessary directories
+BASE_DIR.mkdir(exist_ok=True)
+(BASE_DIR / "JSONs").mkdir(exist_ok=True)
+
+# Default cosmetics
+DEFAULT_COSMETICS = {
+    "skins": "CID_001_Athena_Commando_F",
+    "backblings": "BID_001_BlueSquire",
+    "pickaxes": "Pickaxe_ID_001_Default",
+    "emotes": "EID_DanceMoves",
+    "wraps": "Wrap_001_Default",
+    "gliders": "Glider_ID_001_Default",
+    "contrails": "Trails_ID_001_Default",
+    "music": "Musicpack_001_Default"
+}
+
+# Global variables
+cosmetics_cache: Dict[str, List[str]] = {}
+last_cosmetic_fetch: float = 0
+current_cosmetics: Dict[str, str] = {}
+selected_cosmetics: Dict[str, str] = {}
+fortnite_version: str = ""
+config: Dict[str, Any] = {
+    "enableAllSkins": True,
+    "enableAllBackblings": True,
+    "enableAllPickaxes": True,
+    "enableAllEmotes": True,
+    "enableAllWraps": True,
+    "enableAllGliders": True,
+    "enableAllContrails": True,
+    "enableAllMusic": True,
+    "randomizeEachMatch": True,
+    "avoidRecentItems": True,
+    "recentItemsToAvoid": 5,
+    "debugMode": False,
+    "autoUpdateCheck": True,
+    "notifyOnKick": True,
+    "creativeOnly": True
+}
+
+# Locks for thread safety
+config_lock = Lock()
+cache_lock = Lock()
+selection_lock = Lock()
+version_lock = Lock()
+
+class FortniteVersionManager:
+    """Manages Fortnite version information and compatibility checks"""
+    
+    def __init__(self):
+        self.current_version = None
+        self.known_versions = {}
+        self.last_check = 0
+        self.check_interval = 3600  # 1 hour
+    
+    def load_version_info(self) -> None:
+        """Load saved version information from file"""
+        with version_lock:
+            try:
+                if VERSION_FILE.exists():
+                    with open(VERSION_FILE, "r", encoding='utf-8') as f:
+                        version_data = json.load(f)
+                        self.current_version = version_data.get("current_version")
+                        self.known_versions = version_data.get("known_versions", {})
+                        self.last_check = version_data.get("last_check", 0)
+                    logger.info(f"Loaded version info: current_version={self.current_version}")
+                else:
+                    logger.warning("No version info file found")
+            except Exception as e:
+                logger.error(f"Failed to load version info: {e}")
+    
+    def save_version_info(self) -> None:
+        """Save version information to file"""
+        with version_lock:
+            try:
+                version_data = {
+                    "current_version": self.current_version,
+                    "known_versions": self.known_versions,
+                    "last_check": self.last_check
+                }
+                with open(VERSION_FILE, "w", encoding='utf-8') as f:
+                    json.dump(version_data, f, indent=2)
+                logger.info(f"Saved version info: current_version={self.current_version}")
+            except Exception as e:
+                logger.error(f"Failed to save version info: {e}")
+    
+    def check_fortnite_version(self) -> bool:
+        """
+        Check if the current Fortnite version is compatible by monitoring local directory changes
+        Returns: True if compatible (matches initial or unchanged version), False if changed
+        """
+        current_time = time.time()
+        
+        try:
+            logger.info("Checking Fortnite version from local directory...")
+            # Define the Fortnite directory to monitor (adjust if your install path differs)
+            fortnite_dir = Path("C:/Program Files/Epic Games/Fortnite/FortniteGame/Binaries/Win64")
+            if not fortnite_dir.exists():
+                logger.error(f"Fortnite directory not found: {fortnite_dir}")
+                return self.current_version is not None
+            
+            # Get the latest modification time of key files
+            key_files = [
+                fortnite_dir / "FortniteClient-Win64-Shipping.exe",
+                fortnite_dir / "FortniteLauncher.exe"
+            ]
+            latest_mtime = 0
+            for file in key_files:
+                if file.exists():
+                    mtime = file.stat().st_mtime
+                    latest_mtime = max(latest_mtime, mtime)
+                else:
+                    logger.warning(f"Key file not found: {file}")
+            
+            if not latest_mtime:
+                logger.warning("No key files found to determine version")
+                return self.current_version is not None
+            
+            # Use modification time as a version proxy (convert to string)
+            new_version = f"mtime_{int(latest_mtime)}"
+            
+            # If no version info exists (fresh publish), assume this is the compatible version
+            if not VERSION_FILE.exists() or not self.current_version:
+                logger.info(f"Initial version detected: {new_version} - assuming compatible")
+                self.current_version = new_version
+                self.known_versions[new_version] = {"first_seen": current_time, "compatible": True}
+                self.last_check = current_time
+                self.save_version_info()
+                return True
+            
+            # Check if version (mtime) changed
+            if new_version != self.current_version:
+                logger.warning(f"Fortnite version changed: {self.current_version} -> {new_version} (based on file updates)")
+                self.current_version = new_version
+                self.known_versions[new_version] = {"first_seen": current_time, "compatible": False}
+                self.save_version_info()
+                return False
+            
+            # If version matches and within check interval, use cached compatibility
+            if current_time - self.last_check < self.check_interval:
+                return self.is_version_compatible(self.current_version)
+            
+            self.last_check = current_time
+            self.save_version_info()
+            return self.is_version_compatible(new_version)
+            
+        except Exception as e:
+            logger.error(f"Failed to check Fortnite version from local directory: {e}")
+            return self.current_version is not None
+    
+    def is_version_compatible(self, version: str) -> bool:
+        """Check if a specific version is marked as compatible"""
+        if not version:
+            return False
+        return self.known_versions.get(version, {}).get("compatible", False)
+    
+    def mark_version_compatible(self, version: str, compatible: bool = True) -> None:
+        """Mark a version as compatible or incompatible"""
+        with version_lock:
+            if version in self.known_versions:
+                self.known_versions[version]["compatible"] = compatible
+            else:
+                self.known_versions[version] = {"first_seen": time.time(), "compatible": compatible}
+            self.save_version_info()
+            logger.info(f"Marked version {version} as {'compatible' if compatible else 'incompatible'}")
+
+# Initialize version manager
+version_manager = FortniteVersionManager()
+
+def save_config() -> None:
+    """Save configuration to config.json"""
+    with config_lock:
+        try:
+            CONFIG_FILE.parent.mkdir(exist_ok=True)
+            with open(CONFIG_FILE, "w", encoding='utf-8') as f:
+                json.dump(config, f, indent=2)
+            logger.info("Saved configuration to config.json")
+        except Exception as e:
+            logger.error(f"Failed to save config: {e}")
+
+def load_config() -> None:
+    """Load configuration from config.json"""
+    global config
+    with config_lock:
+        try:
+            if CONFIG_FILE.exists():
+                with open(CONFIG_FILE, "r", encoding='utf-8') as f:
+                    loaded_config = json.load(f)
+                    # Update config with loaded values while preserving defaults for new settings
+                    for key, value in loaded_config.items():
+                        config[key] = value
+                logger.info("Loaded configuration from config.json")
+            else:
+                logger.warning("No config.json found, using defaults")
+                save_config()
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid config.json: {e}, using defaults")
+            save_config()
+        except Exception as e:
+            logger.error(f"Error loading config: {e}, using defaults")
+            save_config()
+
+def setup_secure_connection() -> None:
+    """Set up secure connection with certificate verification"""
+    os.environ['SSL_CERT_FILE'] = certifi.where()
+    
+    # Verify certificate file exists
+    if not CERT_FILE.exists():
+        logger.warning(f"Certificate file not found: {CERT_FILE}")
+    else:
+        logger.info(f"Using certificate file: {CERT_FILE}")
+    
+    logger.info("Set up secure connection with certificate verification")
+
+def load_cosmetics() -> Dict[str, List[str]]:
+    """Load cosmetic items from cache or fetch from API"""
+    global cosmetics_cache, last_cosmetic_fetch
+    
+    current_time = time.time()
+    with cache_lock:
+        # Return cached data if it's less than 24 hours old
+        if cosmetics_cache and (current_time - last_cosmetic_fetch < 86400):
+            return cosmetics_cache
+    
+        # Try loading from cache file
+        if COSMETICS_CACHE.exists():
+            try:
+                with open(COSMETICS_CACHE, "r", encoding='utf-8') as f:
+                    cosmetics_cache = json.load(f)
+                required_keys = ["skins", "backblings", "pickaxes", "emotes", "wraps", "gliders", "contrails", "music"]
+                if all(key in cosmetics_cache for key in required_keys):
+                    last_cosmetic_fetch = current_time
+                    logger.info(f"Loaded cosmetics from cache: {len(cosmetics_cache.get('skins', []))} skins")
+                    return cosmetics_cache
+                else:
+                    logger.warning("Cache file missing required categories, fetching new data")
+            except json.JSONDecodeError:
+                logger.warning("Cache file corrupted, fetching new data")
+            except Exception as e:
+                logger.error(f"Error loading cosmetics cache: {e}")
+    
+        # Fetch from API with retries
+        return fetch_cosmetics_from_api(current_time)
+
+def fetch_cosmetics_from_api(current_time: float) -> Dict[str, List[str]]:
+    """Fetch cosmetics data from Fortnite API"""
+    global cosmetics_cache, last_cosmetic_fetch
+    
+    max_retries = 3
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Fetching cosmetics from Fortnite API (attempt {attempt + 1}/{max_retries})...")
+            session = requests.Session()
+            response = session.get(
+                "https://fortnite-api.com/v2/cosmetics/br",
+                timeout=15,
+                headers={"User-Agent": "FortniteProxy/1.2"}
+            )
+            response.raise_for_status()
+            data = response.json().get("data", [])
+            
+            # Initialize categories
+            cosmetics_cache = {
+                "skins": [],
+                "backblings": [],
+                "pickaxes": [],
+                "emotes": [],
+                "wraps": [],
+                "gliders": [],
+                "contrails": [],
+                "music": []
+            }
+            
+            # Process items
+            for item in data:
+                item_type = item.get("type", {}).get("value", "").lower()
+                if item_type == "outfit":
+                    cosmetics_cache["skins"].append(item["id"])
+                elif item_type == "backpack":
+                    cosmetics_cache["backblings"].append(item["id"])
+                elif item_type == "pickaxe":
+                    cosmetics_cache["pickaxes"].append(item["id"])
+                elif item_type == "emote":
+                    cosmetics_cache["emotes"].append(item["id"])
+                elif item_type == "wrap":
+                    cosmetics_cache["wraps"].append(item["id"])
+                elif item_type == "glider":
+                    cosmetics_cache["gliders"].append(item["id"])
+                elif item_type == "contrail":
+                    cosmetics_cache["contrails"].append(item["id"])
+                elif item_type == "music":
+                    cosmetics_cache["music"].append(item["id"])
+            
+            # Verify we have items in all categories
+            if all(len(cosmetics_cache[key]) > 0 for key in cosmetics_cache):
+                with open(COSMETICS_CACHE, "w", encoding='utf-8') as f:
+                    json.dump(cosmetics_cache, f, indent=2)
+                last_cosmetic_fetch = current_time
+                logger.info(f"Fetched cosmetics: {len(cosmetics_cache['skins'])} skins, "
+                          f"{len(cosmetics_cache['backblings'])} backblings, "
+                          f"{len(cosmetics_cache['pickaxes'])} pickaxes, "
+                          f"{len(cosmetics_cache['gliders'])} gliders")
+                return cosmetics_cache
+            else:
+                logger.warning("API returned incomplete data, retrying...")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+        except requests.RequestException as e:
+            logger.error(f"Failed to fetch cosmetics: {e}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+        except Exception as e:
+            logger.error(f"Unexpected error fetching cosmetics: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+    
+    # If all attempts failed, return defaults
+    logger.error("All attempts to fetch cosmetics failed, using defaults")
+    return {category: [DEFAULT_COSMETICS[category]] for category in DEFAULT_COSMETICS}
+
+def randomize_cosmetics() -> None:
+    """Randomize all cosmetic selections"""
+    global selected_cosmetics
+    with selection_lock:
+        selected_cosmetics = {
+            "skins": get_cosmetic('skins'),
+            "backblings": get_cosmetic('backblings'),
+            "pickaxes": get_cosmetic('pickaxes'),
+            "emotes": get_cosmetic('emotes'),
+            "wraps": get_cosmetic('wraps'),
+            "gliders": get_cosmetic('gliders'),
+            "contrails": get_cosmetic('contrails'),
+            "music": get_cosmetic('music')
+        }
+        logger.info(f"Randomized cosmetics: {selected_cosmetics['skins']} (skin), {selected_cosmetics['backblings']} (backbling)")
+
+def get_cosmetic(category: str) -> str:
+    """Select a cosmetic item from the specified category"""
+    cosmetics = load_cosmetics()
+    enabled_key = f"enableAll{category.capitalize()}"
+    
+    # Check if category is enabled
+    with config_lock:
+        if not config.get(enabled_key, True) or not cosmetics[category]:
+            return DEFAULT_COSMETICS[category]
+    
+    # If randomization is disabled, use existing selection
+    with selection_lock:
+        if category in selected_cosmetics and not config.get("randomizeEachMatch", True):
+            return selected_cosmetics[category]
+    
+    # Load recently used items to avoid repetition
+    recent_file = BASE_DIR / f"recent_{category}.json"
+    recent_items = []
+    
+    if config.get("avoidRecentItems", True):
+        try:
+            if recent_file.exists():
+                with open(recent_file, "r", encoding='utf-8') as f:
+                    recent_items = json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not read recent {category} file: {e}")
+    
+    # Filter out recently used items
+    available_items = [item for item in cosmetics[category] if item not in recent_items]
+    
+    # If too few items remain, reset the filter
+    min_items = max(3, len(cosmetics[category]) // 10)
+    if len(available_items) < min_items:
+        available_items = cosmetics[category]
+    
+    # Select a random item
+    selected = random.choice(available_items) if available_items else DEFAULT_COSMETICS[category]
+    
+    # Update the recent items list
+    if config.get("avoidRecentItems", True):
+        recent_count = config.get("recentItemsToAvoid", 5)
+        recent_items.insert(0, selected)
+        recent_items = recent_items[:recent_count]
+        try:
+            with open(recent_file, "w", encoding='utf-8') as f:
+                json.dump(recent_items, f)
+        except Exception as e:
+            logger.warning(f"Could not write recent {category} file: {e}")
+    
+    return selected
+
+def detect_game_mode(content: bytes) -> Optional[str]:
+    """
+    Detect what game mode is being played based on the request/response content
+    Returns: "creative", "battle", or None
+    """
+    if not content:
+        return None
+    
+    try:
+        data = json.loads(content.decode('utf-8'))
+        
+        # Check for indicators of game mode
+        if isinstance(data, dict):
+            # Look for playlist info
+            playlist = data.get("playlist", "")
+            if isinstance(playlist, str):
+                if "creative" in playlist.lower():
+                    return "creative"
+                if "br" in playlist.lower() or "battle" in playlist.lower():
+                    return "battle"
+            
+            # Check matchmaking region
+            session_data = data.get("session", {})
+            if isinstance(session_data, dict):
+                gamemode = session_data.get("gamemode", "")
+                if isinstance(gamemode, str):
+                    if "creative" in gamemode.lower() or "playground" in gamemode.lower():
+                        return "creative"
+                    if "br" in gamemode.lower() or "battle" in gamemode.lower():
+                        return "battle"
+            
+            # Check playlist ID patterns
+            playlist_id = data.get("playlistId", "")
+            if isinstance(playlist_id, str):
+                if playlist_id.startswith("Playlist_Creative") or "CREATIVE" in playlist_id:
+                    return "creative"
+                if playlist_id.startswith("Playlist_DefaultSolo") or "BR_" in playlist_id:
+                    return "battle"
+    
+    except Exception:
+        pass
+    
+    return None
+
+def is_cosmetics_url(url: str) -> bool:
+    """Check if the URL is related to cosmetics endpoints"""
+    endpoints = [
+        "/fortnite/api/game/v2/profile",
+        "/fortnite/api/game/v2/cosmetics/config",
+        "/content/api/pages/fortnite-game",
+        "/affiliate/api/public/affiliates/slug",
+        "/fortnite/api/cloudstorage/user",
+        "/fortnite/api/cloudstorage/system",
+        "/fortnite/api/game/v2/cosmetics/preset"
+    ]
+    return any(endpoint in url for endpoint in endpoints)
+
+def is_match_start(content: bytes) -> bool:
+    """Detect if a match is starting based on the content"""
+    if not content:
+        return False
+    
+    try:
+        data = json.loads(content.decode('utf-8'))
+        if isinstance(data, dict):
+            # Check multiple indicators of match start
+            if data.get("matchmakingResult") == "started" or \
+               data.get("matchStatus") == "starting" or \
+               (data.get("payload") and data.get("payload", {}).get("matchState") == "preparing") or \
+               data.get("state") == "Starting" or \
+               "matchStartingTime" in data:
+                return True
+    except Exception:
+        pass
+    
+    return False
+
+def is_kick_message(content: bytes) -> bool:
+    """Detect if the message is a kick notification"""
+    if not content:
+        return False
+    
+    try:
+        data = json.loads(content.decode('utf-8'))
+        if isinstance(data, dict):
+            # Check for various kick indicators
+            error_msg = data.get("errorMessage", "")
+            if isinstance(error_msg, str) and ("kick" in error_msg.lower() or "banned" in error_msg.lower()):
+                return True
+            
+            # Check for error codes
+            if "errorCode" in data:
+                error_codes = ["COSMETIC_VALIDATION", "ITEM_NOT_OWNED", "LOADOUT_INVALID"]
+                if data.get("errorCode") in error_codes:
+                    return True
+    except Exception:
+        pass
+    
+    return False
+
+def hash_content(content: bytes) -> str:
+    """Create a hash of the content for caching and comparison"""
+    return hashlib.md5(content).hexdigest()
+
+def modify_json_content(content: bytes, url: str) -> bytes:
+    """Modify JSON content to replace cosmetic items"""
+    if not content:
+        return content
+    
+    # Skip modification if not compatible with current version
+    if not version_manager.is_version_compatible(version_manager.current_version) and config.get("autoUpdateCheck", True):
+        logger.warning(f"Skipping modification - incompatible version: {version_manager.current_version}")
+        return content
+    
+    try:
+        # Parse the JSON content
+        data = json.loads(content.decode('utf-8'))
+        
+        # Check if it's a kick message
+        if is_kick_message(content) and config.get("notifyOnKick", True):
+            logger.warning("Detected possible cosmetic kick. Consider changing cosmetics or checking for updates.")
+        
+        # Check for match start and randomize if needed
+        if is_match_start(content) and config.get("randomizeEachMatch", True):
+            logger.info("Match appears to be starting, randomizing cosmetics")
+            randomize_cosmetics()
+        
+        # If creative-only mode is enabled, check game mode
+        if config.get("creativeOnly", True):
+            game_mode = detect_game_mode(content)
+            if game_mode == "battle":
+                logger.info("Battle Royale mode detected, skipping cosmetic modifications")
+                return content
+        
+        # Modify profile data
+        if isinstance(data, dict):
+            # Handle profile changes
+            if "profileChanges" in data:
+                for change in data.get("profileChanges", []):
+                    if isinstance(change, dict) and isinstance(change.get("profile", {}), dict):
+                        items = change.get("profile", {}).get("items", {})
+                        if isinstance(items, dict):
+                            for item_id, item_data in items.items():
+                                if isinstance(item_data, dict) and "templateId" in item_data:
+                                    template = item_data["templateId"]
+                                    if isinstance(template, str):
+                                        with selection_lock:
+                                            if template.startswith("AthenaCharacter:"):
+                                                item_data["templateId"] = f"AthenaCharacter:{selected_cosmetics.get('skins', get_cosmetic('skins'))}"
+                                            elif template.startswith("AthenaBackpack:"):
+                                                item_data["templateId"] = f"AthenaBackpack:{selected_cosmetics.get('backblings', get_cosmetic('backblings'))}"
+                                            elif template.startswith("AthenaPickaxe:"):
+                                                item_data["templateId"] = f"AthenaPickaxe:{selected_cosmetics.get('pickaxes', get_cosmetic('pickaxes'))}"
+                                            elif template.startswith("AthenaDance:"):
+                                                item_data["templateId"] = f"AthenaDance:{selected_cosmetics.get('emotes', get_cosmetic('emotes'))}"
+                                            elif template.startswith("AthenaItemWrap:"):
+                                                item_data["templateId"] = f"AthenaItemWrap:{selected_cosmetics.get('wraps', get_cosmetic('wraps'))}"
+                                            elif template.startswith("AthenaGlider:"):
+                                                item_data["templateId"] = f"AthenaGlider:{selected_cosmetics.get('gliders', get_cosmetic('gliders'))}"
+                                            elif template.startswith("AthenaContrail:"):
+                                                item_data["templateId"] = f"AthenaContrail:{selected_cosmetics.get('contrails', get_cosmetic('contrails'))}"
+                                            elif template.startswith("AthenaMusicPack:"):
+                                                item_data["templateId"] = f"AthenaMusicPack:{selected_cosmetics.get('music', get_cosmetic('music'))}"
+            
+            # Handle loadout data
+            if "statsId" in data and data.get("statsId") == "athenaLoadout" and "loadout" in data:
+                with selection_lock:
+                    data["loadout"].update({
+                        "characterDef": f"AthenaCharacter:{selected_cosmetics.get('skins', get_cosmetic('skins'))}",
+                        "backpackDef": f"AthenaBackpack:{selected_cosmetics.get('backblings', get_cosmetic('backblings'))}",
+                        "pickaxeDef": f"AthenaPickaxe:{selected_cosmetics.get('pickaxes', get_cosmetic('pickaxes'))}",
+                        "danceDef": f"AthenaDance:{selected_cosmetics.get('emotes', get_cosmetic('emotes'))}",
+                        "itemWrapDef": f"AthenaItemWrap:{selected_cosmetics.get('wraps', get_cosmetic('wraps'))}",
+                        "gliderDef": f"AthenaGlider:{selected_cosmetics.get('gliders', get_cosmetic('gliders'))}",
+                        "contrailDef": f"AthenaContrail:{selected_cosmetics.get('contrails', get_cosmetic('contrails'))}",
+                        "musicPackDef": f"AthenaMusicPack:{selected_cosmetics.get('music', get_cosmetic('music'))}"
+                    })
+        
+        # Debug logging if enabled
+        if config.get("debugMode", False):
+            content_hash = hash_content(content)
+            modified_content = json.dumps(data).encode('utf-8')
+            modified_hash = hash_content(modified_content)
+            if content_hash != modified_hash:
+                logger.debug(f"Modified content for URL: {url} (original hash: {content_hash}, new hash: {modified_hash})")
+        
+        return json.dumps(data).encode('utf-8')
+    
+    except Exception as e:
+        logger.error(f"Error modifying JSON: {e}")
+        if config.get("debugMode", False):
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+        return content
+
+def request(flow: http.HTTPFlow) -> None:
+    """Handle outgoing requests"""
+    if not flow.request or not flow.request.url:
+        return
+    
+    # Debug logging
+    is_related = is_cosmetics_url(flow.request.url)
+    if config.get("debugMode", False) and "fortnite" in flow.request.host and is_related:
+        logger.debug(f"Request: {flow.request.url}")
+    
+    # Check Fortnite version if needed
+    if "fortnite" in flow.request.host and "/fortnite/api/game/v2/" in flow.request.url and config.get("autoUpdateCheck", True):
+        version_manager.check_fortnite_version()
+    
+    # Modify cosmetics in requests
+    if is_related and flow.request.content:
+        try:
+            flow.request.content = modify_json_content(flow.request.content, flow.request.url)
+        except Exception as e:
+            logger.error(f"Request modification failed: {e}")
+            if config.get("debugMode", False):
+                import traceback
+                logger.debug(f"Traceback: {traceback.format_exc()}")
+
+def response(flow: http.HTTPFlow) -> None:
+    """Handle incoming responses"""
+    if not flow.request or not flow.request.url:
+        return
+    
+    # Check for related endpoints
+    if is_cosmetics_url(flow.request.url) and flow.response and flow.response.content:
+        try:
+            flow.response.content = modify_json_content(flow.response.content, flow.request.url)
+        except Exception as e:
+            logger.error(f"Response modification failed: {e}")
+            if config.get("debugMode", False):
+                import traceback
+                logger.debug(f"Traceback: {traceback.format_exc()}")
+
+def error(flow: http.HTTPFlow) -> None:
+    """Handle errors in requests/responses"""
+    if flow.error:
+        url = flow.request.url if flow.request else "Unknown URL"
+        error_msg = f"Flow error on {url}: {flow.error}"
+        logger.error(error_msg)
+        if config.get("debugMode", False):
+            print(f"ERROR: {error_msg}")
+
+def start() -> None:
+    """Initialize and start the proxy"""
+    print("Fortnite Cosmetics Proxy starting...")
+    logger.info("========================================")
+    logger.info("Fortnite Cosmetics Proxy Starting")
+    logger.info("========================================")
+    
+    # Setup environment
+    setup_secure_connection()
+    load_config()
+    version_manager.load_version_info()
+    
+    # Initial version check
+    if config.get("autoUpdateCheck", True):
+        is_compatible = version_manager.check_fortnite_version()
+        if is_compatible:
+            logger.info("Compatible with latest version of Fortnite")
+            print("Compatible with latest version of Fortnite")
+        else:
+            logger.warning(f"Current Fortnite version {version_manager.current_version} is incompatible - update may be required")
+            print(f"WARNING: Fortnite version {version_manager.current_version} is incompatible - update may be required")
+    
+    # Load cosmetics and make initial selection
+    cosmetics = load_cosmetics()
+    randomize_cosmetics()
+    
+    # Print startup information
+    logger.info(f"Loaded cosmetics - Skins: {len(cosmetics['skins'])}, "
+               f"Backblings: {len(cosmetics['backblings'])}, "
+               f"Pickaxes: {len(cosmetics['pickaxes'])}, "
+               f"Gliders: {len(cosmetics['gliders'])}")
+    logger.info(f"Initial cosmetic selection - Skin: {selected_cosmetics.get('skins')}")
+                
+    # Print status message
+    if config.get("creativeOnly", True):
+        print("Running in Creative Mode only (Battle Royale mode disabled)")
+    else:
+        print("WARNING: All game modes enabled - not recommended!")
+    
+    print("Proxy server started successfully!")
+
+def set_compatibility(compatible: bool = True) -> None:
+    """Utility function to mark the current version as compatible or not"""
+    current_version = version_manager.current_version
+    if current_version:
+        version_manager.mark_version_compatible(current_version, compatible)
+        status = "compatible" if compatible else "incompatible"
+        logger.info(f"Marked version {current_version} as {status}")
+        print(f"Marked Fortnite version {current_version} as {status}")
+    else:
+        logger.warning("No current version detected, cannot set compatibility")
+        print("No current version detected, cannot set compatibility")
+
+def reset_cosmetics() -> None:
+    """Reset selected cosmetics to defaults"""
+    global selected_cosmetics
+    with selection_lock:
+        selected_cosmetics = {category: DEFAULT_COSMETICS[category] for category in DEFAULT_COSMETICS}
+    logger.info("Reset all cosmetics to defaults")
+    print("Reset all cosmetics to defaults")
+
+if __name__ == "__main__":
+    start()
