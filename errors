@@ -1,4 +1,0 @@
-cd C:\CRMplus\Main
-javac -d ..\bin CRMplus.java
-cd ..\bin
-jar cfe CRMplus.jar CRMplus *.class
